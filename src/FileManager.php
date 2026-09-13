@@ -6,6 +6,8 @@ namespace Tihloh\Prefab\Files;
 
 use DateTimeInterface;
 use RuntimeException;
+use Tihloh\Prefab\PrefabConfig;
+use Tihloh\Prefab\PrefabRuntime;
 use Tihloh\Prefab\Files\Contracts\DiskInterface;
 
 /**
@@ -21,12 +23,15 @@ final class FileManager
     private array $disks = [];
     /** @var array<string, callable[]> */
     private array $listeners = [];
+    private array $config = [];
+    private array $loggingConfig = ['enabled' => true];
     private string $default;
     private ?string $temporaryUrlBase = null;
     private ?string $signingKey = null;
 
     public function __construct(array $config = [])
     {
+        $this->config = $config;
         $this->default = (string) ($config['default'] ?? 'local');
         $this->temporaryUrlBase = isset($config['temporary_url'])
             ? rtrim((string) $config['temporary_url'], '?')
@@ -46,6 +51,17 @@ final class FileManager
             ));
             $this->default = 'local';
         }
+
+        PrefabRuntime::register('files', $this);
+    }
+
+    public function prefabConfigure(): void
+    {
+        $logging = PrefabConfig::resolve('files', 'logging', $this->config, ['enabled' => true]);
+        $value = $logging['value'];
+        $this->loggingConfig = is_array($value) ? $value : ['enabled' => (bool) $value];
+        $this->loggingConfig['enabled'] = (bool) ($this->loggingConfig['enabled'] ?? true);
+        PrefabRuntime::recordResolution('files', 'logging', $logging['source'], ['enabled' => $this->loggingConfig['enabled']]);
     }
 
     public function add(string $name, DiskInterface $disk): self
@@ -85,12 +101,6 @@ final class FileManager
         return $this;
     }
 
-    /**
-     * Store string content.
-     *
-     * The third argument stays backward compatible with the original API: pass
-     * a disk name string, or pass an options array such as ['collision'=>'rename'].
-     */
     public function put(
         string $path,
         string $contents,
@@ -100,11 +110,9 @@ final class FileManager
         [$disk, $options] = $this->resolveDiskOptions($diskOrOptions, $options);
         $storage = $this->disk($disk);
         $target = $this->resolveCollision($storage, $path, $options['collision'] ?? 'overwrite');
-
         if ($target === null) {
             return $storage->info($path);
         }
-
         $info = $storage->put($target, $contents);
         $this->emit('stored', $info, $disk ?? $this->default, ['source' => 'contents']);
         return $info;
@@ -120,11 +128,9 @@ final class FileManager
         [$disk, $options] = $this->resolveDiskOptions($diskOrOptions, $options);
         $storage = $this->disk($disk);
         $target = $this->resolveCollision($storage, $path, $options['collision'] ?? 'overwrite');
-
         if ($target === null) {
             return $storage->info($path);
         }
-
         $info = $storage->putStream($target, $stream);
         $this->emit('stored', $info, $disk ?? $this->default, ['source' => 'stream']);
         return $info;
@@ -139,12 +145,10 @@ final class FileManager
         if (!is_file($sourcePath) || !is_readable($sourcePath)) {
             throw new RuntimeException("Source file is not readable: {$sourcePath}");
         }
-
         $stream = fopen($sourcePath, 'rb');
         if ($stream === false) {
             throw new RuntimeException("Unable to open source file: {$sourcePath}");
         }
-
         try {
             return $this->putStream($targetPath, $stream, $diskOrOptions, $options);
         } finally {
@@ -152,10 +156,6 @@ final class FileManager
         }
     }
 
-    /**
-     * Store an upload-like object without depending on prefab-input.
-     * The object must expose tmpPath() and may expose name()/extension().
-     */
     public function storeUploaded(
         object $upload,
         string $directory = '',
@@ -166,12 +166,10 @@ final class FileManager
         if (!method_exists($upload, 'tmpPath')) {
             throw new RuntimeException('Uploaded object must provide tmpPath().');
         }
-
         $source = (string) $upload->tmpPath();
         if (!is_file($source) || !is_readable($source)) {
             throw new RuntimeException('Uploaded temporary file is not readable.');
         }
-
         if ($name === null) {
             $original = method_exists($upload, 'name') ? (string) $upload->name() : 'upload';
             $extension = method_exists($upload, 'extension')
@@ -179,7 +177,6 @@ final class FileManager
                 : pathinfo($original, PATHINFO_EXTENSION);
             $name = $this->uniqueName($extension);
         }
-
         $path = trim($directory, '/');
         $path = ($path === '' ? '' : $path . '/') . $name;
         return $this->putFile($source, $path, $diskOrOptions, $options);
@@ -285,12 +282,6 @@ final class FileManager
         return $this->disk($disk)->deleteDirectory($directory, $recursive);
     }
 
-    /**
-     * Build a signed application URL for a private file.
-     *
-     * Files only signs and verifies the URL; the host route/controller remains
-     * responsible for authorization and streaming the file.
-     */
     public function temporaryUrl(
         string $path,
         int|DateTimeInterface $expires = 600,
@@ -303,7 +294,6 @@ final class FileManager
         $expiresAt = $expires instanceof DateTimeInterface ? $expires->getTimestamp() : time() + max(1, $expires);
         $payload = $disk . "\n" . $path . "\n" . $expiresAt;
         $signature = hash_hmac('sha256', $payload, $this->signingKey);
-
         return $this->temporaryUrlBase . '?' . http_build_query([
             'disk' => $disk,
             'path' => $path,
@@ -338,7 +328,6 @@ final class FileManager
         if (!$disk->exists($path)) {
             return $path;
         }
-
         return match (strtolower($strategy)) {
             'overwrite' => $path,
             'skip' => null,
@@ -354,7 +343,6 @@ final class FileManager
         $directory = $directory === '.' ? '' : trim($directory, '/');
         $extension = pathinfo($path, PATHINFO_EXTENSION);
         $filename = pathinfo($path, PATHINFO_FILENAME);
-
         for ($i = 1; $i < 100000; $i++) {
             $name = $filename . '-' . $i . ($extension === '' ? '' : '.' . $extension);
             $candidate = ($directory === '' ? '' : $directory . '/') . $name;
@@ -362,7 +350,6 @@ final class FileManager
                 return $candidate;
             }
         }
-
         throw new RuntimeException("Unable to find an available filename for: {$path}");
     }
 
@@ -379,6 +366,56 @@ final class FileManager
         foreach ($this->listeners[strtolower($event)] ?? [] as $listener) {
             $listener($file, $disk, $context, $this);
         }
+        $this->logLifecycle($event, $file, $disk, $context);
+    }
+
+    private function logLifecycle(string $event, FileInfo $file, string $disk, array $context): void
+    {
+        if (!(bool) ($this->loggingConfig['enabled'] ?? true)) { return; }
+        $scopeType = strtoupper((string) ($this->loggingConfig['scope_type'] ?? 'APP'));
+        $scopePath = $this->loggingConfig['scope_path'] ?? null;
+        $visibility = strtoupper((string) ($this->loggingConfig['visibility'] ?? match ($scopeType) {
+            'USER' => 'USER',
+            'ORGANIZATION' => 'ORGANIZATION',
+            default => 'ADMIN',
+        }));
+        $action = match (strtolower($event)) {
+            'stored' => 'file.stored',
+            'deleted' => 'file.deleted',
+            'copied' => 'file.copied',
+            'moved' => 'file.moved',
+            default => 'file.' . strtolower($event),
+        };
+        PrefabRuntime::emitLog([
+            'classification' => 'AUDIT',
+            'level' => strtolower($event) === 'deleted' ? 'NOTICE' : 'INFO',
+            'module' => 'files',
+            'action' => $action,
+            'scope_type' => $scopeType,
+            'scope_path' => $scopePath,
+            'visibility' => $visibility,
+            'subject_type' => 'file',
+            'subject_id' => $file->path(),
+            'actor_id' => PrefabRuntime::actorId(),
+            'status' => 'SUCCESS',
+            'message' => match (strtolower($event)) {
+                'stored' => 'File was stored.',
+                'deleted' => 'File was deleted.',
+                'copied' => 'File was copied.',
+                'moved' => 'File was moved.',
+                default => 'File lifecycle event occurred.',
+            },
+            'details' => [
+                'data' => [
+                    'name' => $file->name(),
+                    'path' => $file->path(),
+                    'size' => $file->size(),
+                    'mime' => $file->mime(),
+                    'disk' => $disk,
+                ],
+                'context' => $context,
+            ],
+        ]);
     }
 
     private function makeDisk(mixed $definition): DiskInterface
@@ -389,7 +426,6 @@ final class FileManager
         if (!is_array($definition)) {
             throw new RuntimeException('Storage disk configuration must be a DiskInterface or array.');
         }
-
         $driver = strtolower((string) ($definition['driver'] ?? 'local'));
         return match ($driver) {
             'local' => new LocalDisk(
